@@ -13,7 +13,10 @@ basename = os.path.basename
 # Argument parser
 parser = argparse.ArgumentParser()
 parser.add_argument('--gt_path', type=str, default='data/breast/test_masks')
-parser.add_argument('--seg_path', type=str, default='crf_outputs/breast/test_CRF')
+# IMPORTANT: Default path points to sam_outputs (final pipeline output, ~78% DSC)
+# Do NOT evaluate saliency_map_outputs (~46% DSC) or coarse_outputs (~58% DSC)
+# Those are intermediate stages. Only sam_outputs contains the final results.
+parser.add_argument('--seg_path', type=str, default='sam_outputs/breast/masks')
 
 args = parser.parse_args()
 gt_path = args.gt_path

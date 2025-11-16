@@ -69,8 +69,20 @@ def evaluate_on_sample(model, processor, tokenizer, text, image_paths, args):
     return average_dice
 
 # Function to perform hyperparameter optimization
+# WARNING: This hyperparameter optimization is FRAGILE and NOT RECOMMENDED for production use.
+# It optimizes global parameters on only 3 random samples, which is:
+# 1. Non-deterministic (different results on each run)
+# 2. High variance (poor samples can lead to bad parameters)
+# 3. Not academically rigorous (3 samples is insufficient for reliable optimization)
+# 
+# The paper's results were likely generated using the default parameters:
+# vbeta=0.1, vvar=1.0, vlayer=7
+# 
+# If you use --hyper-opt, ensure you have a proper validation set at --val-path
+# and understand that results may vary significantly between runs.
 def hyper_opt(model, processor, tokenizer, text, args):
     print("Running Hyperparameter Optimization ...")
+    print("WARNING: This optimization uses only 3 random samples and may not be reliable.")
 
     # Define lists of possible hyperparameter values
     vbeta_list = [0.1, 1.0, 2.0]
@@ -213,7 +225,7 @@ if __name__ == '__main__':
     parser.add_argument('--tlayer', type=int, default=9)
     parser.add_argument('--model-name', type=str, default="BiomedCLIP", help="Which CLIP model to use")
     parser.add_argument('--finetuned', action='store_true', help="Whether to use finetuned weights or not")
-    parser.add_argument('--hyper-opt', action='store_true', help="Whether to optimize hyperparameters or not")
+    parser.add_argument('--hyper-opt', action='store_true', help="Whether to optimize hyperparameters or not. WARNING: Uses only 3 random samples - not recommended for production use. Default parameters (vbeta=0.1, vvar=1.0, vlayer=7) are stable and recommended.")
     parser.add_argument('--device', type=str, default="cuda", help="Device to run the model on")
     parser.add_argument('--ensemble', action='store_true', help="Whether to use text ensemble or not")
     parser.add_argument('--seed', type=int, default=42, help="Random seed for reproducibility")
