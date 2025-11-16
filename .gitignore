@@ -1,0 +1,30 @@
+data/
+tmp_full/
+segment-anything/sam_checkpoints/
+tmp_smoke/
+biomedclip_finetuning/open_clip/src/
+
+# Model and checkpoint binaries
+saliency_maps/model/
+*.pth
+*.pt
+*.bin
+
+# Temporary outputs and caches
+tmp_*
+*.log
+__pycache__/
+
+# Python envs / IDE
+venv/
+.venv/
+env/
+ENV/
+.idea/
+.vscode/
+
+# Large artifacts and data that should not be pushed
+*.h5
+*.ckpt
+*.npz
+data/*

@@ -129,8 +129,9 @@ parser.add_argument(
 parser.add_argument("--device", type=str, default="cuda", help="The device to run generation on.")
 
 def write_mask_to_folder(mask , t_mask, path: str,num_contours) -> None:
-    file = t_mask.split("/")[-1]
-    filename = f"{file}"
+    # Use basename to support Windows paths and ensure parent dir exists
+    file = os.path.basename(t_mask)
+    filename = file
     mask = cv2.threshold(mask, 0.5, 1, cv2.THRESH_BINARY)[1]
     mask = mask.astype(np.uint8)*255
     nb_blobs, im_with_separated_blobs, stats, _ = cv2.connectedComponentsWithStats(mask)
@@ -146,7 +147,9 @@ def write_mask_to_folder(mask , t_mask, path: str,num_contours) -> None:
         if sizes[index_blob] in top_k_sizes:
             im_result[im_with_separated_blobs == index_blob] = 255
     mask = im_result
-    cv2.imwrite(os.path.join(path, filename), mask)
+    out_path = os.path.join(path, filename)
+    os.makedirs(os.path.dirname(out_path) or path, exist_ok=True)
+    cv2.imwrite(out_path, mask)
 
     return
 
