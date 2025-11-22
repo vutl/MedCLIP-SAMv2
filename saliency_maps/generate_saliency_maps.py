@@ -18,7 +18,8 @@ import random
 import numpy as np
 from transformers import CLIPProcessor, CLIPModel, CLIPTokenizerFast
 from PIL import Image
-from scripts.methods import vision_heatmap_iba
+from scripts.methods import vision_heatmap_iba, vision_heatmap_freq_aware
+from scripts.freq_components import SmartFusionBlock, DWTForward
 from text_prompts import *
 
 # Disable parallel tokenization warnings
@@ -162,6 +163,11 @@ def main(args):
         tokenizer = CLIPTokenizerFast.from_pretrained("openai/clip-vit-base-patch16")
     elif(args.model_name == "CLIP" and args.finetuned):
         model = AutoModel.from_pretrained("./model", trust_remote_code=True).to(args.device)
+        
+    # Initialize FreqMedCLIP components
+    fusion_block = SmartFusionBlock(hf_channels=777, lf_channels=1, out_channels=32).to(args.device)
+    fusion_block.eval()
+    dwt_module = DWTForward().to(args.device)
 
     if(not args.reproduce):
         # Get user input for the text to generate saliency maps
@@ -203,7 +209,7 @@ def main(args):
         text_ids = torch.tensor([tokenizer.encode(text, add_special_tokens=True)]).to(args.device)
         
         # Generate visual saliency map
-        vmap = vision_heatmap_iba(text_ids, image_feat, model, args.vlayer, args.vbeta, args.vvar, ensemble=args.ensemble, progbar=False)
+        vmap = vision_heatmap_freq_aware(text_ids, image_feat, model, args.vlayer, args.vbeta, args.vvar, fusion_block, dwt_module, ensemble=args.ensemble, progbar=False)
 
         # Resize and save the saliency map
         img = np.array(image)

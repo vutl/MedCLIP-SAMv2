@@ -161,6 +161,25 @@ class image_encoder_wrapper(nn.Module):
         else:
             return x
 
+    def forward_intermediate(self, x, layer_idx=3, emb_input=False):
+        """
+        Forward pass that returns both the final output and the intermediate output at layer_idx.
+        Used for FreqMedCLIP to extract HF features from early layers.
+        """
+        if not emb_input:
+            x = self.embeddings(x)
+        x = self.norm(x).to(self.dtype)
+        
+        intermediate_output = None
+        
+        for i, layer in enumerate(self.transformer.blocks):
+            x = layer(x.to(self.dtype))
+            if i == layer_idx:
+                intermediate_output = x.clone().detach()
+                
+        final_output = self.proj(x[:, 0])
+        return {'final_output': final_output, 'intermediate_output': intermediate_output}
+
 class TextEmbeddings(nn.Module):
     def __init__(self, token_embedding, positional_embedding, dtype):
         super().__init__()
@@ -218,6 +237,9 @@ class ClipWrapper(nn.Module):
 
     def get_text_features(self, x, output_hidden_states=False, emb_input=False):
         return self.text_model(x, output_hidden_states, emb_input)
+
+    def get_image_features_intermediate(self, x, layer_idx=3, emb_input=False):
+        return self.vision_model.forward_intermediate(x, layer_idx, emb_input)
 
 # """
 # The code below wraps the openai clip model to faciliate extracting layers and encoders.
