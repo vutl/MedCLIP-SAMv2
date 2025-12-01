@@ -217,9 +217,9 @@ def main():
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"Using device: {device}")
     
-    # Load BiomedCLIP
-    print("Loading BiomedCLIP...")
-    model_name = "chuhac/BiomedCLIP-vit-bert-hf"
+    # Load BiomedCLIP from local model
+    print("Loading BiomedCLIP from local model...")
+    model_name = "saliency_maps/model"
     processor = AutoProcessor.from_pretrained(model_name, trust_remote_code=True)
     tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
     biomedclip = AutoModel.from_pretrained(model_name, trust_remote_code=True).to(device)
@@ -249,7 +249,17 @@ def main():
     print("Starting Training...")
     os.makedirs(args.save_dir, exist_ok=True)
     
+    # Load validation dataset for metrics
+    print(f"Loading validation dataset: {args.dataset}...")
+    val_dataset = FreqMedCLIPDataset(args.data_root, args.dataset, processor, tokenizer, split='val')
+    val_loader = DataLoader(val_dataset, batch_size=args.batch_size, shuffle=False, num_workers=0)
+    print(f"Validation samples: {len(val_dataset)}")
+    
+    best_dice = 0.0
+    best_epoch = 0
+    
     for epoch in range(args.epochs):
+        # Training phase
         model.train()
         epoch_loss = 0
         
@@ -282,10 +292,56 @@ def main():
                 return
         
         avg_loss = epoch_loss / len(train_loader)
-        print(f"Epoch {epoch+1} Average Loss: {avg_loss:.4f}")
         
-        # Save Checkpoint
-        torch.save(fusion.state_dict(), os.path.join(args.save_dir, f"fusion_{args.dataset}_epoch{epoch+1}.pth"))
+        # Validation phase
+        model.eval()
+        val_dice_scores = []
+        val_iou_scores = []
+        
+        with torch.no_grad():
+            for batch in val_loader:
+                pixel_values = batch['pixel_values'].to(device)
+                input_ids = batch['input_ids'].to(device)
+                masks = batch['mask'].to(device).float()
+                
+                preds = model(pixel_values, input_ids).squeeze(1)
+                
+                # Calculate metrics
+                for i in range(preds.shape[0]):
+                    pred_binary = (torch.sigmoid(preds[i]) > 0.5).float()
+                    target = masks[i]
+                    
+                    intersection = (pred_binary * target).sum()
+                    union = pred_binary.sum() + target.sum()
+                    dice = (2. * intersection + 1e-8) / (union + 1e-8)
+                    iou = (intersection + 1e-8) / (pred_binary.sum() + target.sum() - intersection + 1e-8)
+                    
+                    val_dice_scores.append(dice.item())
+                    val_iou_scores.append(iou.item())
+        
+        avg_dice = np.mean(val_dice_scores)
+        avg_iou = np.mean(val_iou_scores)
+        
+        print(f"Epoch {epoch+1}/{args.epochs} - Loss: {avg_loss:.4f} | Dice: {avg_dice:.4f} | IoU: {avg_iou:.4f}")
+        
+        # Save best checkpoint only
+        if avg_dice > best_dice:
+            best_dice = avg_dice
+            best_epoch = epoch + 1
+            
+            # Remove old best checkpoint
+            old_checkpoints = [f for f in os.listdir(args.save_dir) if f.startswith(f"fusion_{args.dataset}_") and f.endswith('.pth')]
+            for old_ckpt in old_checkpoints:
+                os.remove(os.path.join(args.save_dir, old_ckpt))
+            
+            # Save new best
+            checkpoint_path = os.path.join(args.save_dir, f"fusion_{args.dataset}_epoch{epoch+1}.pth")
+            torch.save(fusion.state_dict(), checkpoint_path)
+            print(f"✓ New best model saved! Dice: {best_dice:.4f}")
+    
+    print(f"\n{'='*60}")
+    print(f"Training completed! Best epoch: {best_epoch} (Dice: {best_dice:.4f})")
+    print(f"{'='*60}")
 
 if __name__ == '__main__':
     main()

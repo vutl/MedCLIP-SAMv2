@@ -46,12 +46,12 @@ def main():
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"Device: {device}")
     
-    # Load BiomedCLIP
-    print("\nLoading BiomedCLIP...")
-    model_name = "chuhac/BiomedCLIP-vit-bert-hf"
-    processor = AutoProcessor.from_pretrained(model_name, trust_remote_code=True)
-    tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
-    biomedclip = AutoModel.from_pretrained(model_name, trust_remote_code=True).to(device)
+    # Load BiomedCLIP from local model
+    print("\nLoading BiomedCLIP from local model...")
+    model_path = "saliency_maps/model"
+    processor = AutoProcessor.from_pretrained(model_path, trust_remote_code=True)
+    tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
+    biomedclip = AutoModel.from_pretrained(model_path, trust_remote_code=True).to(device)
     
     # Initialize components
     print("Loading trained model...")
@@ -83,19 +83,62 @@ def main():
     
     all_metrics = []
     
+    # Create visualizations directory
+    vis_dir = f"visualizations/{args.dataset}_eval"
+    os.makedirs(vis_dir, exist_ok=True)
+    print(f"Visualizations will be saved to: {vis_dir}")
+    
+    sample_count = 0
+    
     with torch.no_grad():
-        for batch in tqdm(test_loader, desc="Evaluating"):
+        for batch_idx, batch in enumerate(tqdm(test_loader, desc="Evaluating")):
             pixel_values = batch['pixel_values'].to(device)
             input_ids = batch['input_ids'].to(device)
             masks = batch['mask'].to(device)
+            img_names = batch['img_name']
             
             # Forward
             preds = model(pixel_values, input_ids).squeeze(1)
             
-            # Calculate metrics for each sample in batch
+            # Calculate metrics and save visualizations for each sample in batch
             for i in range(preds.shape[0]):
                 metrics = calculate_metrics(preds[i], masks[i])
                 all_metrics.append(metrics)
+                
+                # Save visualization every 10 samples or first 5
+                if sample_count < 5 or sample_count % 10 == 0:
+                    pred_binary = (torch.sigmoid(preds[i]) > 0.5).cpu().numpy()
+                    mask_np = masks[i].cpu().numpy()
+                    
+                    # Create visualization
+                    import matplotlib.pyplot as plt
+                    fig, axes = plt.subplots(1, 3, figsize=(15, 5))
+                    
+                    # Ground truth
+                    axes[0].imshow(mask_np, cmap='gray')
+                    axes[0].set_title('Ground Truth')
+                    axes[0].axis('off')
+                    
+                    # Prediction
+                    axes[1].imshow(pred_binary, cmap='gray')
+                    axes[1].set_title(f'Prediction\nDice: {metrics["dice"]:.3f}')
+                    axes[1].axis('off')
+                    
+                    # Overlay
+                    overlay = np.zeros((*mask_np.shape, 3))
+                    overlay[mask_np > 0.5] = [0, 1, 0]  # Green for GT
+                    overlay[pred_binary > 0.5] = [1, 0, 0]  # Red for pred
+                    overlay[(mask_np > 0.5) & (pred_binary > 0.5)] = [1, 1, 0]  # Yellow for overlap
+                    axes[2].imshow(overlay)
+                    axes[2].set_title('Overlay (GT=Green, Pred=Red)')
+                    axes[2].axis('off')
+                    
+                    plt.tight_layout()
+                    save_path = os.path.join(vis_dir, f"{img_names[i].replace('.png', '')}_vis.png")
+                    plt.savefig(save_path, dpi=150, bbox_inches='tight')
+                    plt.close()
+                
+                sample_count += 1
     
     # Aggregate results
     print("\n" + "="*60)
@@ -136,6 +179,7 @@ def main():
         f.write(f"Recall:      {avg_metrics['recall']:.4f} ± {std_metrics['recall']:.4f}\n")
     
     print(f"\n✓ Results saved to: {results_file}")
+    print(f"✓ Visualizations saved to: {vis_dir}/ ({sample_count} samples)")
     print("="*60)
 
 if __name__ == '__main__':
