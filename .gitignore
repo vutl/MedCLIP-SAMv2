@@ -1,0 +1,46 @@
+# Data directories
+data/
+coarse_outputs/
+sam_outputs/
+saliency_map_outputs/
+visualizations/
+
+# Checkpoints and models
+checkpoints/
+saliency_maps/model/pytorch_model.bin
+segment-anything/sam_checkpoints/
+biomedclip_finetuning/open_clip/src/data/
+
+# External repositories
+FMISeg/
+U-Mamba/
+segment-anything/
+
+# Documentation and papers
+FINAL_VALIDATION_REPORT.md
+TGCam.pdf
+
+# Run files  
+run_files/
+training_output.log
+train_log.txt
+
+# Python cache
+__pycache__/
+**/__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+*.so
+*.egg
+*.egg-info/
+dist/
+build/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
