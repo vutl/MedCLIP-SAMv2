@@ -114,15 +114,9 @@ def vision_heatmap_tgcam(text_t, image_t, model, layer_idx=7, tgcam_instance=Non
             print(f"Detected CLS token. Sliced from {V_seq} -> {visual_features_patches.shape[1]} patches.")
         
         # --- Engineering Fix: Use passed instance ---
+        # --- Engineering Fix: Use passed instance ---
         if tgcam_instance is None:
-            # Fallback for backward compatibility, but log warning
-            print("WARNING: Re-initializing TGCAM. Pass an instance for efficiency.")
-            tgcam = TGCAMPipeline(
-                visual_dim=visual_dim,
-                text_dim=text_dim,
-                mid_channels=kwargs.get('common_dim', 512),
-                num_item_iterations=kwargs.get('num_item_iterations', 2)
-            ).to(device)
+            raise ValueError("tgcam_instance must be provided. Random initialization is forbidden.")
         else:
             tgcam = tgcam_instance
         

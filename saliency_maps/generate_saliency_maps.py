@@ -98,6 +98,11 @@ def hyper_opt(model, processor, tokenizer, text, args):
 
     results = []  # Store results of each combination
 
+    # Sample 10 images globally for consistent comparison
+    random.seed(42)
+    sampled_images_global = random.sample(all_image_ids, min(10, len(all_image_ids)))
+    print(f"Selected {len(sampled_images_global)} validation images for optimization.")
+
     # Iterate through each hyperparameter combination
     for combo in hyperparameter_combinations:
         vbeta, vvar, layer = combo
@@ -110,12 +115,22 @@ def hyper_opt(model, processor, tokenizer, text, args):
         print(f"Evaluating combination: vbeta={vbeta}, vvar={vvar}, layer={layer}")
 
         # Run 3 random samples to get an average performance
-        for i in range(3):
-            random.seed(i)
-            sampled_images = random.sample(all_image_ids, 1)
-            avg_dice = evaluate_on_sample(model, processor, tokenizer, text, sampled_images, args)
-            sample_dice_scores.append(avg_dice)
-            print(f"  Sample {i+1}: Average Dice Score = {avg_dice}")
+        # Run 10 random samples to get an average performance
+        # Sample once per combination to ensure fairness? 
+        # No, to be fair we should use the SAME samples for all combinations.
+        # But here we just want to avoid re-seeding inside the loop in a way that limits randomness.
+        # Actually, best practice: Sample N images ONCE outside the loop.
+        
+        # However, to minimize code changes, I will just increase N and remove the seed inside loop.
+        # But wait, if I remove seed inside loop, I get different images for each combo?
+        # That makes comparison noisy.
+        # I will sample images ONCE outside the loop.
+        
+        sample_dice_scores = []
+        for i, image_id in enumerate(sampled_images_global):
+             avg_dice = evaluate_on_sample(model, processor, tokenizer, text, [image_id], args)
+             sample_dice_scores.append(avg_dice)
+             # print(f"  Sample {i+1}: Average Dice Score = {avg_dice}")
 
         # Calculate mean Dice score for this hyperparameter combination
         mean_dice = np.mean(sample_dice_scores)

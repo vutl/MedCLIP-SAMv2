@@ -61,7 +61,7 @@ from scripts.freq_components import DWTForward, SmartFusionBlock
 import torch.nn.functional as F
 
 
-def vision_heatmap_freq_aware(text_t, image_t, model, layer_idx, beta, var, fusion_block, dwt_module=None, lr=1, train_steps=10, ensemble=False, progbar=True):
+def vision_heatmap_freq_aware(text_t, image_t, model, layer_idx, beta, var, fusion_block, cross_attn, attn_proj, shallow_fusion, dwt_module=None, lr=1, train_steps=10, ensemble=False, progbar=True):
     """
     Generates a frequency-aware saliency map using Smart Single-Stream and Coarse-to-Fine Fusion.
     
@@ -79,6 +79,9 @@ def vision_heatmap_freq_aware(text_t, image_t, model, layer_idx, beta, var, fusi
         beta: IBA beta parameter (Unused in Dot Product version)
         var: IBA variance parameter (Unused in Dot Product version)
         fusion_block: SmartFusionBlock module
+        cross_attn: Trained MultiheadAttention module
+        attn_proj: Trained Linear projection module
+        shallow_fusion: Trained ShallowFusionBlock module
         dwt_module: Pre-initialized DWTForward module (for efficiency)
         lr: IBA learning rate (Unused)
         train_steps: IBA training steps (Unused)
@@ -97,13 +100,13 @@ def vision_heatmap_freq_aware(text_t, image_t, model, layer_idx, beta, var, fusi
         vision_outputs = model.vision_model(image_t, output_hidden_states=True)
         hidden_states = vision_outputs['hidden_states']
         
-        # Get Text Embeddings for Dot Product Attention
+        # Get Text Embeddings for Cross-Attention
         # text_t is already tokenized input_ids
         text_outputs = model.text_model(text_t, output_hidden_states=True)
         if isinstance(text_outputs, tuple):
-            text_embeds = text_outputs[1]  # pooler_output
+            text_embeds = text_outputs[0]  # last_hidden_state (B, SeqLen, 768)
         else:
-            text_embeds = text_outputs.pooler_output
+            text_embeds = text_outputs.last_hidden_state
     
     # Extract features at different depths:
     # - Early layer (index 4 = layer 3 after embeddings) for High-Frequency branch
@@ -124,43 +127,37 @@ def vision_heatmap_freq_aware(text_t, image_t, model, layer_idx, beta, var, fusi
     i_hf = dwt_module(image_t)  # (B, C*3, H/2, W/2) - e.g., (1, 9, 112, 112) for 224x224 RGB
     
     # 2b. Convert early ViT features from sequence format to spatial format
-    # Remove CLS token (index 0) and reshape to spatial grid
+    # Re-introduced f_early extraction for ShallowFusionBlock
     b, seq_len, dim = f_early.shape
     grid_len = seq_len - 1  # Subtract CLS token
     grid_size = int(grid_len ** 0.5)
     
-    # Validate grid is square
-    if grid_size * grid_size != grid_len:
-        raise ValueError(f"Non-square grid: seq_len={seq_len}, grid_len={grid_len}, grid_size={grid_size}")
-    
     # Reshape: (B, seq_len-1, dim) → (B, dim, grid_size, grid_size)
     f_early_spatial = f_early[:, 1:, :].permute(0, 2, 1).reshape(b, dim, grid_size, grid_size)
     
-    # 2c. Upsample early features to match wavelet resolution
-    # This enables pixel-level fusion
-    target_size = i_hf.shape[-2:]  # Match wavelet output size
-    f_early_up = F.interpolate(f_early_spatial, size=target_size, mode='bilinear', align_corners=False)
-    
-    # 2d. Combine wavelet (texture/edges) with early ViT features (mid-level semantics)
+    # 2d. Fuse DWT and Shallow features using ShallowFusionBlock
     # Per Pipeline.md: "Injection (Tiêm tần số): ... cộng vào feature này"
-    f_hf = torch.cat([i_hf, f_early_up], dim=1)  # (B, 9+dim, H/2, W/2) - e.g., (1, 777, 112, 112)
+    f_hf = shallow_fusion(i_hf, f_early_spatial)  # (B, 32, 112, 112)
     
     # ============================================================================
-    # STEP 3: GENERATE COARSE MAP using DOT PRODUCT (Single-Stream)
+    # STEP 3: GENERATE COARSE MAP using CROSS-ATTENTION (Single-Stream)
     # ============================================================================
-    # Replaced IBA with direct Dot Product Attention to match training pipeline
-    # and ensure true Single-Stream execution.
+    # Replaced IBA/DotProduct with Cross-Attention to match training pipeline
     
     # 1. Prepare Patch Embeddings from f_deep
     # f_deep is (B, 197, 768). Remove CLS token.
     patch_embeddings = f_deep[:, 1:, :] # (B, 196, 768)
     
-    # 2. Normalize features
-    patch_embeddings = F.normalize(patch_embeddings, dim=-1)
-    text_embeds = F.normalize(text_embeds, dim=-1)
+    # 2. Cross-Attention
+    # Query=Visual, Key=Text, Value=Text
+    # Use full text sequence for Key/Value to allow spatial localization
+    text_seq = text_embeds # (B, SeqLen, 768)
     
-    # 3. Dot Product Attention: (B, 196, D) * (B, D, 1) -> (B, 196, 1)
-    coarse_map_flat = torch.bmm(patch_embeddings, text_embeds.unsqueeze(-1))
+    # attn_output: (B, 196, 768)
+    attn_output, _ = cross_attn(query=patch_embeddings, key=text_seq, value=text_seq)
+    
+    # 3. Project to 1 channel: (B, 196, 1)
+    coarse_map_flat = attn_proj(attn_output)
     
     # 4. Reshape to spatial map
     H_feat = W_feat = int(np.sqrt(patch_embeddings.shape[1]))
@@ -190,12 +187,18 @@ def vision_heatmap_freq_aware(text_t, image_t, model, layer_idx, beta, var, fusi
     
     s_fine_np = s_fine_up.squeeze().cpu().numpy()
     
-    # Normalize to [0, 1] range
-    s_min, s_max = s_fine_np.min(), s_fine_np.max()
-    if s_max - s_min > 1e-8:
-        s_fine_np = (s_fine_np - s_min) / (s_max - s_min)
+    # Normalize using 98th percentile (Robust to outliers)
+    # Per feedback: "Replace Min-Max normalization ... with Percentile normalization"
+    v_min = s_fine_np.min()
+    v_p98 = np.percentile(s_fine_np, 98)
+    
+    if v_p98 - v_min > 1e-8:
+        s_fine_np = (s_fine_np - v_min) / (v_p98 - v_min)
     else:
-        s_fine_np = np.zeros_like(s_fine_np)  # Handle edge case of uniform map
+        s_fine_np = np.zeros_like(s_fine_np)
+        
+    # Clip to [0, 1]
+    s_fine_np = np.clip(s_fine_np, 0, 1)
     
     return s_fine_np
 

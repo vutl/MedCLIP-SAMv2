@@ -13,13 +13,46 @@ from tqdm import tqdm
 from transformers import AutoModel, AutoProcessor, AutoTokenizer
 import cv2
 
+# Try importing albumentations
+try:
+    import albumentations as A
+    from albumentations.pytorch import ToTensorV2
+    ALBUMENTATIONS_AVAILABLE = True
+except ImportError:
+    ALBUMENTATIONS_AVAILABLE = False
+    print("Warning: albumentations not found. Data augmentation will be disabled.")
+
 # Add parent directory to path for imports
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
 # Import our custom components
-from freqmedclip.scripts.freq_components import SmartFusionBlock, DWTForward
+from freqmedclip.scripts.freq_components import SmartDecoderBlock, DWTForward, FrequencyEncoder, BottleneckFusion, FPNAdapter
 from scripts.methods import vision_heatmap_iba
 from saliency_maps.text_prompts import *
+from loss.hnl import HardNegativeLoss
+
+# --- 0. Data Augmentation ---
+def get_transforms(split='train'):
+    if not ALBUMENTATIONS_AVAILABLE:
+        return None
+        
+    if split == 'train':
+        return A.Compose([
+            A.Resize(224, 224),
+            A.HorizontalFlip(p=0.5),
+            A.VerticalFlip(p=0.5),
+            A.Rotate(limit=30, p=0.5),
+            A.RandomBrightnessContrast(p=0.2),
+            A.ElasticTransform(alpha=1, sigma=50, alpha_affine=50, p=0.2),
+            A.Normalize(mean=(0.48145466, 0.4578275, 0.40821073), std=(0.26862954, 0.26130258, 0.27577711)),
+            ToTensorV2()
+        ])
+    else:
+        return A.Compose([
+            A.Resize(224, 224),
+            A.Normalize(mean=(0.48145466, 0.4578275, 0.40821073), std=(0.26862954, 0.26130258, 0.27577711)),
+            ToTensorV2()
+        ])
 
 # --- 1. Dataset Class ---
 class FreqMedCLIPDataset(Dataset):
@@ -28,7 +61,7 @@ class FreqMedCLIPDataset(Dataset):
         Args:
             root_dir (str): Path to 'data' directory
             dataset_name (str): Name of dataset (e.g., 'breast_tumors')
-            processor: BiomedCLIP processor
+            processor: BiomedCLIP processor (used if albumentations not available or for text)
             tokenizer: BiomedCLIP tokenizer
             split (str): 'train' or 'val'
         """
@@ -44,9 +77,9 @@ class FreqMedCLIPDataset(Dataset):
         
         self.image_files = sorted([f for f in os.listdir(self.img_dir) if f.endswith(('.png', '.jpg', '.jpeg'))])
         
+        self.transforms = get_transforms(split)
+        
         # Load prompts based on dataset name
-        # This is a simplified logic mapping dataset names to prompt lists from text_prompts.py
-        # In a real scenario, you might want more specific logic or a mapping file
         self.prompts = []
         if 'breast' in dataset_name:
             self.prompts = breast_tumor_P2_prompts + benign_breast_tumor_P3_prompts + malignant_breast_tumor_P3_prompts
@@ -55,7 +88,6 @@ class FreqMedCLIPDataset(Dataset):
         elif 'brain' in dataset_name:
             self.prompts = brain_tumor_P2_prompts + glioma_brain_tumor_P3_prompts + meningioma_brain_tumor_P3_prompts + pituitary_brain_tumor_P3_prompts
         else:
-            # Fallback generic prompt
             self.prompts = ["A medical image showing an abnormality."]
             
     def __len__(self):
@@ -67,25 +99,30 @@ class FreqMedCLIPDataset(Dataset):
         mask_path = os.path.join(self.mask_dir, img_name)
         
         # Load Image
-        image = Image.open(img_path).convert('RGB')
-        original_size = image.size[::-1] # (H, W)
+        image = cv2.imread(img_path)
+        image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
         
         # Load Mask
         try:
-            mask = Image.open(mask_path).convert('L')
-            mask = np.array(mask)
+            mask = cv2.imread(mask_path, cv2.IMREAD_GRAYSCALE)
+            if mask is None:
+                raise ValueError("Mask not found")
             mask = (mask > 127).astype(np.float32) # Binary mask
         except Exception as e:
-            print(f"Error loading mask {mask_path}: {e}")
-            mask = np.zeros(original_size, dtype=np.float32)
+            # print(f"Error loading mask {mask_path}: {e}")
+            mask = np.zeros((image.shape[0], image.shape[1]), dtype=np.float32)
 
-        # Process Image for BiomedCLIP
-        inputs = self.processor(images=image, return_tensors="pt")
-        pixel_values = inputs['pixel_values'].squeeze(0) # (3, 224, 224)
-        
-        # Resize mask to match model output (224x224) for loss calculation
-        mask_resized = cv2.resize(mask, (224, 224), interpolation=cv2.INTER_NEAREST)
-        mask_tensor = torch.from_numpy(mask_resized).long()
+        # Apply Transforms
+        if self.transforms:
+            augmented = self.transforms(image=image, mask=mask)
+            pixel_values = augmented['image']
+            mask_tensor = augmented['mask'].long()
+        else:
+            # Fallback to processor if albumentations missing
+            inputs = self.processor(images=image, return_tensors="pt")
+            pixel_values = inputs['pixel_values'].squeeze(0)
+            mask_resized = cv2.resize(mask, (224, 224), interpolation=cv2.INTER_NEAREST)
+            mask_tensor = torch.from_numpy(mask_resized).long()
         
         # Randomly select a text prompt
         text_prompt = random.choice(self.prompts)
@@ -101,94 +138,131 @@ class FreqMedCLIPDataset(Dataset):
 
 # --- 2. Model Wrapper ---
 class FrequencyMedCLIPSAMv2(nn.Module):
-    def __init__(self, biomedclip_model, fusion_block, dwt_module, args):
+    def __init__(self, biomedclip_model, dwt_module, freq_encoder, fpn_adapter, bottleneck_fusion, args):
         super().__init__()
         self.biomedclip = biomedclip_model
-        self.fusion_block = fusion_block
         self.dwt_module = dwt_module
-        self.args = args
+        self.freq_encoder = freq_encoder
+        self.fpn_adapter = fpn_adapter
+        self.bottleneck_fusion = bottleneck_fusion
         
-        # Freeze BiomedCLIP
+        # --- Freeze BiomedCLIP ---
         for param in self.biomedclip.parameters():
             param.requires_grad = False
-            
+        
+        # Unfreeze specific layers for multi-scale adaptation
+        layers_to_unfreeze = [3, 6, 9, 11] # 0-indexed
+        for i in layers_to_unfreeze:
+            for param in self.biomedclip.vision_model.encoder.layers[i].parameters():
+                param.requires_grad = True
+        self.biomedclip.vision_model.post_layernorm.requires_grad_(True)
+        
+        # --- Progressive Decoder with Skip Connections ---
+        # FPN Output Scales:
+        # s1: 14x14 (768) - Bottleneck
+        # s2: 28x28 (384) - Skip 1
+        # s3: 56x56 (192) - Skip 2
+        # s4: 112x112 (96) - Skip 3 (Optional, usually not used in U-Net bottleneck-up flow directly unless deep supervision)
+        
+        # Frequency Encoder Output Scales:
+        # f3: 14x14 (256) - Bottleneck Fusion
+        # f2: 28x28 (128) - Skip Fusion 1
+        # f1: 56x56 (64)  - Skip Fusion 2
+        
+        # Stage 1: 14 -> 28
+        # Input: Fused Bottleneck (768)
+        # Skip: FPN s2 (384)
+        # Freq Skip: f2 (128)
+        # Total In: 768 + 384 + 128 = 1280 -> Out: 384
+        self.dec1 = SmartDecoderBlock(in_channels=768, out_channels=384, skip_channels=384, freq_channels=128, use_lffi=True)
+        
+        # Stage 2: 28 -> 56
+        # Input: 384
+        # Skip: FPN s3 (192)
+        # Freq Skip: f1 (64)
+        # Total In: 384 + 192 + 64 = 640 -> Out: 192
+        self.dec2 = SmartDecoderBlock(in_channels=384, out_channels=192, skip_channels=192, freq_channels=64, use_lffi=True)
+        
+        # Stage 3: 56 -> 112
+        # Input: 192
+        # Skip: FPN s4 (96)
+        # Freq Skip: None (or raw DWT?)
+        # Let's use FPN s4.
+        # Total In: 192 + 96 = 288 -> Out: 96
+        self.dec3 = SmartDecoderBlock(in_channels=192, out_channels=96, skip_channels=96, freq_channels=0, use_lffi=True)
+        
+        # --- Final Segmentation Head ---
+        # 112 -> 224
+        self.final_up = nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False)
+        self.seg_head = nn.Conv2d(96, 1, kernel_size=1)
+        
     def forward(self, pixel_values, input_ids):
-        # 1. Extract Features using BiomedCLIP (Frozen)
-        # We need to hook into the model to get intermediate layers if we want to do it exactly like generate_saliency_maps.py
-        # However, vision_heatmap_freq_aware in methods.py seems to handle the forward pass logic.
-        # But for training, we need a differentiable forward pass.
-        # Let's re-implement the core logic of 'vision_heatmap_freq_aware' here but in a differentiable way.
-        
-        # Note: vision_heatmap_freq_aware uses hooks which might be tricky for backprop if not careful.
-        # A cleaner way for training is to rely on the fact that we just need the features.
-        
-        # For this implementation, we will simplify and assume we can get the features.
-        # Since modifying the internal forward of BiomedCLIP is complex without the code of `vision_heatmap_freq_aware` (which I can't see fully but I know it exists),
-        # I will assume we can use the `vision_heatmap_iba` or similar logic adapted for training.
-        
-        # WAIT: I need to see `scripts/methods.py` to know how `vision_heatmap_freq_aware` works. 
-        # Since I cannot see it right now, I will implement a standard forward pass that mimics the pipeline:
-        # Image -> DWT -> HF
-        # Image -> BiomedCLIP -> LF (and intermediate HF)
-        # LF + Text -> Coarse Map (M2IB logic - simplified here as dot product for now or use the existing method if importable)
-        # Coarse + HF -> Fusion -> Fine Map
-        
-        # Let's use the components we have.
-        
-        # A. Get Image Features (LF)
+        # 1. Image Encoder (ViT)
         vision_outputs = self.biomedclip.vision_model(pixel_values, output_hidden_states=True)
-        # Last layer hidden state: (B, 197, 768) for ViT-B/16 usually
-        last_hidden_state = vision_outputs.last_hidden_state 
+        hidden_states = vision_outputs.hidden_states
         
-        # B. Get Text Features
-        # BiomedCLIP text_model returns tuple: (last_hidden_state, pooler_output, hidden_states)
+        # Extract features (B, 197, 768)
+        # We only need the last layer output for FPNAdapter
+        f_last = hidden_states[-1][:, 1:, :] # (B, 196, 768)
+        
+        B, N, C = f_last.shape
+        H = W = int(N**0.5) # 14
+        
+        # Reshape to (B, C, 14, 14)
+        x_vit_last = f_last.permute(0, 2, 1).view(B, C, H, W)
+        
+        # 2. FPN Adapter (Generate Multi-Scale Features)
+        # [s1(14), s2(28), s3(56), s4(112)]
+        fpn_feats = self.fpn_adapter(x_vit_last)
+        x_bottleneck = fpn_feats[0] # 14x14
+        x_skip1 = fpn_feats[1]      # 28x28
+        x_skip2 = fpn_feats[2]      # 56x56
+        x_skip3 = fpn_feats[3]      # 112x112
+        
+        # 3. Text Encoder
         text_outputs = self.biomedclip.text_model(input_ids, output_hidden_states=True)
         if isinstance(text_outputs, tuple):
-            text_embeds = text_outputs[1]  # pooler_output is the second element
+            text_embeds = text_outputs[0]  # (B, SeqLen, 768)
         else:
-            text_embeds = text_outputs.pooler_output
-        # text_embeds shape: (B, 768)
+            text_embeds = text_outputs.last_hidden_state
+
+        # 4. Parallel Frequency Encoder
+        # DWT on original image (B, 3, 224, 224) -> (B, 9, 112, 112)
+        dwt_feats = self.dwt_module(pixel_values)
         
-        # C. Coarse Map Generation (Simplified M2IB/CAM)
-        # Project text to image dimension if needed, or just dot product
-        # Assuming ViT: (B, N_patches+1, D)
-        patch_embeddings = last_hidden_state[:, 1:, :] # Remove CLS token, (B, 196, 768)
+        # Encode Frequency Features: [f3(14), f2(28), f1(56)]
+        freq_feats = self.freq_encoder(dwt_feats, text_embeds=text_embeds)
+        x_freq_bottleneck = freq_feats[0] # 14x14
+        x_freq_skip1 = freq_feats[1]      # 28x28
+        x_freq_skip2 = freq_feats[2]      # 56x56
         
-        # Normalize
-        patch_embeddings = F.normalize(patch_embeddings, dim=-1)
-        text_embeds = F.normalize(text_embeds, dim=-1)
+        # 5. Bottleneck Fusion
+        # Fuse ViT Bottleneck with Frequency Features
+        x_fused = self.bottleneck_fusion(x_bottleneck, x_freq_bottleneck)
+            
+        # 6. Progressive Decoding with Skips and LFFI
         
-        # Dot product: (B, 196, D) * (B, D, 1) -> (B, 196, 1)
-        coarse_map_flat = torch.bmm(patch_embeddings, text_embeds.unsqueeze(-1))
+        # Stage 1: 14 -> 28
+        # Use Fused Features as input
+        x = self.dec1(x_fused, skip=x_skip1, freq_skip=x_freq_skip1, text_embeds=text_embeds)
         
-        # Reshape to (B, 1, 14, 14) assuming 224x224 image and patch size 16
-        H_feat = W_feat = int(np.sqrt(patch_embeddings.shape[1]))
-        coarse_map = coarse_map_flat.view(-1, 1, H_feat, W_feat)
+        # Stage 2: 28 -> 56
+        x = self.dec2(x, skip=x_skip2, freq_skip=x_freq_skip2, text_embeds=text_embeds)
         
-        # D. High Frequency Features
-        # 1. From DWT
-        dwt_feats = self.dwt_module(pixel_values) # (B, 9, 112, 112)
+        # Stage 3: 56 -> 112
+        x = self.dec3(x, skip=x_skip3, freq_skip=None, text_embeds=text_embeds) 
         
-        # 2. From Shallow Layers of ViT (e.g., layer 3)
-        # hidden_states is a tuple. Index 3 is layer 3 output.
-        shallow_feats = vision_outputs.hidden_states[3][:, 1:, :] # (B, 196, 768)
-        shallow_feats = shallow_feats.permute(0, 2, 1).view(-1, 768, H_feat, W_feat) # (B, 768, 14, 14)
+        # 7. Final Prediction
+        x = self.final_up(x) # 112 -> 224
+        logits = self.seg_head(x)
         
-        # Upsample shallow feats to match DWT size (112x112)
-        shallow_feats_up = F.interpolate(shallow_feats, size=(112, 112), mode='bilinear', align_corners=False)
+        # Prepare features for HNL (Contrastive Loss)
+        # Pool bottleneck features: (B, C, 14, 14) -> (B, C)
+        img_feats_pooled = F.adaptive_avg_pool2d(x_fused, (1, 1)).squeeze(-1).squeeze(-1)
+        # Pool text features: (B, SeqLen, 768) -> (B, 768)
+        text_feats_pooled = torch.max(text_embeds, dim=1)[0]
         
-        # Concatenate DWT and Shallow features
-        # Note: We need to adjust channels. SmartFusionBlock expects `hf_channels`.
-        # In main script it was 777 (768 + 9).
-        hf_features = torch.cat([shallow_feats_up, dwt_feats], dim=1) # (B, 777, 112, 112)
-        
-        # E. Fusion
-        saliency_fine = self.fusion_block(hf_features, coarse_map) # (B, 1, 112, 112)
-        
-        # Upsample to 224x224 for loss
-        saliency_final = F.interpolate(saliency_fine, size=(224, 224), mode='bilinear', align_corners=False)
-        
-        return saliency_final
+        return logits, img_feats_pooled, text_feats_pooled
 
 # --- 3. Loss Function ---
 class DiceLoss(nn.Module):
@@ -212,8 +286,10 @@ def main():
     parser.add_argument('--dataset', type=str, required=True, help='Dataset name (e.g., breast_tumors)')
     parser.add_argument('--data-root', type=str, default='../data', help='Path to data directory')
     parser.add_argument('--epochs', type=int, default=50)
-    parser.add_argument('--batch-size', type=int, default=8)
-    parser.add_argument('--lr', type=float, default=1e-4)
+    parser.add_argument('--batch-size', type=int, default=32) # Increased batch size
+    parser.add_argument('--grad-accum-steps', type=int, default=1, help='Gradient accumulation steps')
+    parser.add_argument('--lr', type=float, default=1e-4) # Base LR for decoder
+    parser.add_argument('--backbone-lr', type=float, default=1e-5) # Lower LR for backbone
     parser.add_argument('--save-dir', type=str, default='../checkpoints')
     parser.add_argument('--dry-run', action='store_true', help='Run a single batch for debugging')
     args = parser.parse_args()
@@ -230,24 +306,49 @@ def main():
     
     # Initialize Components
     print("Initializing Fusion Components...")
+    # DWT Module
     dwt = DWTForward().to(device)
-    # HF Channels = 768 (ViT) + 9 (DWT) = 777
-    fusion = SmartFusionBlock(hf_channels=777, lf_channels=1, out_channels=32).to(device)
+    
+    # FPN Adapter
+    fpn_adapter = FPNAdapter(in_channels=768, out_channels=[768, 384, 192, 96]).to(device)
+    
+    # Frequency Encoder
+    # Input: 9 channels (DWT), Output: Multi-scale
+    freq_encoder = FrequencyEncoder(in_channels=9, base_channels=64, text_dim=768).to(device)
+    
+    # Bottleneck Fusion
+    bottleneck_fusion = BottleneckFusion(dim=768, freq_dim=256).to(device)
     
     # Model Wrapper
-    model = FrequencyMedCLIPSAMv2(biomedclip, fusion, dwt, args).to(device)
+    model = FrequencyMedCLIPSAMv2(biomedclip, dwt, freq_encoder, fpn_adapter, bottleneck_fusion, args).to(device)
     
     # Dataset & DataLoader
     print(f"Loading Dataset: {args.dataset}...")
     train_dataset = FreqMedCLIPDataset(args.data_root, args.dataset, processor, tokenizer, split='train')
     train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, num_workers=0) # Windows: set num_workers=0
     
-    # Optimizer
-    optimizer = torch.optim.AdamW(fusion.parameters(), lr=args.lr)
+    # Optimizer with Differential Learning Rates
+    # Group 1: Backbone (Unfrozen layers) -> Low LR
+    # Group 2: Decoder & Fusion (Scratch) -> High LR
+    backbone_params = filter(lambda p: p.requires_grad, model.biomedclip.parameters())
+    decoder_params = list(model.dec1.parameters()) + \
+                     list(model.dec2.parameters()) + \
+                     list(model.dec3.parameters()) + \
+                     list(model.freq_encoder.parameters()) + \
+                     list(model.fpn_adapter.parameters()) + \
+                     list(model.bottleneck_fusion.parameters()) + \
+                     list(model.final_up.parameters()) + \
+                     list(model.seg_head.parameters())
+                     
+    optimizer = torch.optim.AdamW([
+        {'params': backbone_params, 'lr': args.backbone_lr},
+        {'params': decoder_params, 'lr': args.lr}
+    ])
     
     # Loss
     dice_criterion = DiceLoss()
     bce_criterion = nn.BCEWithLogitsLoss()
+    hnl_criterion = HardNegativeLoss()
     
     # Training Loop
     print("Starting Training...")
@@ -268,28 +369,39 @@ def main():
         epoch_loss = 0
         
         pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{args.epochs}")
-        for batch in pbar:
+        optimizer.zero_grad() # Initialize gradients
+        
+        for batch_idx, batch in enumerate(pbar):
             pixel_values = batch['pixel_values'].to(device)
             input_ids = batch['input_ids'].to(device)
             masks = batch['mask'].to(device).float()
             
-            optimizer.zero_grad()
+            # optimizer.zero_grad() # Handled by gradient accumulation
             
             # Forward
-            preds = model(pixel_values, input_ids) # (B, 1, 224, 224)
+            preds, img_feats, text_feats = model(pixel_values, input_ids) # (B, 1, 224, 224)
             preds = preds.squeeze(1)
             
             # Loss
             loss_dice = dice_criterion(preds, masks)
             loss_bce = bce_criterion(preds, masks)
-            loss = loss_dice + loss_bce
+            loss_hnl = hnl_criterion(img_feats, text_feats, batch_size=pixel_values.shape[0])
+            
+            # Total Loss (Weighted)
+            loss = loss_dice + loss_bce + 0.1 * loss_hnl
+            
+            # Normalize loss for gradient accumulation
+            loss = loss / args.grad_accum_steps
             
             # Backward
             loss.backward()
-            optimizer.step()
+            
+            if (batch_idx + 1) % args.grad_accum_steps == 0:
+                optimizer.step()
+                optimizer.zero_grad()
             
             epoch_loss += loss.item()
-            pbar.set_postfix({'loss': loss.item()})
+            pbar.set_postfix({'loss': loss.item(), 'hnl': loss_hnl.item()})
             
             if args.dry_run:
                 print("Dry run completed successfully.")
@@ -308,7 +420,8 @@ def main():
                 input_ids = batch['input_ids'].to(device)
                 masks = batch['mask'].to(device).float()
                 
-                preds = model(pixel_values, input_ids).squeeze(1)
+                preds, _, _ = model(pixel_values, input_ids)
+                preds = preds.squeeze(1)
                 
                 # Calculate metrics
                 for i in range(preds.shape[0]):
@@ -340,7 +453,7 @@ def main():
             
             # Save new best
             checkpoint_path = os.path.join(args.save_dir, f"fusion_{args.dataset}_epoch{epoch+1}.pth")
-            torch.save(fusion.state_dict(), checkpoint_path)
+            torch.save(model.state_dict(), checkpoint_path)
             print(f"[BEST] New best model saved! Dice: {best_dice:.4f}")
     
     print(f"\n{'='*60}")

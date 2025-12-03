@@ -57,18 +57,24 @@ class SharpenedTGCAM(nn.Module):
     Sharpened Symmetric Attention.
     Uses temperature scaling to produce sparse saliency maps.
     """
-    def __init__(self, visual_dim: int, text_dim: int, mid_channels: int = 512):
+    def __init__(self, visual_dim: int, text_dim: int, mid_channels: int = 512, out_channels: Optional[int] = None):
         super().__init__()
         self.mid_channels = mid_channels
+        self.out_channels = out_channels if out_channels is not None else visual_dim
+        
         self.v_proj = nn.Linear(visual_dim, mid_channels)
         self.t_proj = nn.Linear(text_dim, mid_channels)
         
         # Fusion conv for feature output
         self.fusion_conv = nn.Sequential(
-            nn.Conv2d(mid_channels * 2, visual_dim, kernel_size=1),
-            nn.GroupNorm(8, visual_dim),
+            nn.Conv2d(mid_channels * 2, self.out_channels, kernel_size=1),
+            nn.GroupNorm(8, self.out_channels),
             nn.ReLU(inplace=True)
         )
+        
+        # Residual projection if input dim != output dim
+        if visual_dim != self.out_channels:
+             self.residual_proj = nn.Conv2d(visual_dim, self.out_channels, kernel_size=1)
 
 
     def forward(self, visual_features: torch.Tensor, text_features: torch.Tensor, spatial_size: int, temperature: float = 0.07) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -104,14 +110,11 @@ class SharpenedTGCAM(nn.Module):
         # Residual connection: Project original visual features to match fused_out's channels
         # fused_out: [B, visual_dim, H, H]
         # visual_features: [B, N, C_v] -> Need to match visual_dim
-        if C_v != fused_out.shape[1]:
-            # Add a learnable projection if dimensions mismatch
-            if not hasattr(self, 'residual_proj'):
-                self.residual_proj = nn.Conv2d(C_v, fused_out.shape[1], kernel_size=1).to(visual_features.device)
-            original_v = visual_features.permute(0, 2, 1).view(B, C_v, spatial_size, spatial_size)
-            original_v = self.residual_proj(original_v)
-        else:
-            original_v = visual_features.permute(0, 2, 1).view(B, C_v, spatial_size, spatial_size)
+        
+        original_v = visual_features.permute(0, 2, 1).view(B, C_v, spatial_size, spatial_size)
+        
+        if hasattr(self, 'residual_proj'):
+             original_v = self.residual_proj(original_v)
         
         return fused_out + original_v, saliency_map
 
