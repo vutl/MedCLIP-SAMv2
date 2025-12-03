@@ -71,10 +71,12 @@ class CrossAttentionLFFI(nn.Module):
         
         # Text Projection
         # Note: input_text_len should match the tokenizer's max_length (77 for CLIP)
+        # FIX: Use Linear instead of Conv1d to avoid mixing tokens across sequence
         self.text_project = nn.Sequential(
-            nn.Conv1d(input_text_len, output_text_len, kernel_size=1, stride=1),
+            nn.Linear(embed_dim, in_channels), # Project embedding dim
+            nn.LayerNorm(in_channels),
             nn.GELU(),
-            nn.Linear(embed_dim, in_channels),
+            nn.Linear(in_channels, in_channels),
             nn.LeakyReLU(),
         )
         
@@ -108,20 +110,9 @@ class CrossAttentionLFFI(nn.Module):
         # Flatten visual features: [B, C, H, W] -> [B, HW, C]
         vis_flat = x.flatten(2).transpose(1, 2)
         
-        # Project Text: [B, L, D] -> [B, L_out, C]
-        # Conv1d expects [B, C_in, L_in], so we might need to transpose if input is [B, L, D]
-        # But here Conv1d is (input_text_len, output_text_len, 1), acting on the sequence dimension?
-        # In original code: nn.Conv1d(input_text_len, output_text_len, ...)
-        # This implies it treats the embedding dim as 'width' and sequence len as 'channels'?
-        # Let's verify input shape. Original: txt is [B, L, C].
-        # If we pass [B, 77, 768], and Conv1d is (77, 77, 1), it expects input (B, 77, 768).
-        # PyTorch Conv1d takes (B, C_in, L_in). So if we want to mix sequence positions, 
-        # we should treat L as Channels.
-        # So input should be [B, 77, 768] -> [B, 768, 77]? No, Conv1d(in_channels, out_channels).
-        # If in_channels=input_text_len=77, then input must be (B, 77, 768).
-        # Yes, that works.
-        
-        txt_proj = self.text_project(txt) # [B, L_out, C]
+        # Project Text: [B, L, D] -> [B, L, C]
+        # FIX: Apply Linear projection to the last dimension (D)
+        txt_proj = self.text_project(txt) # [B, L, C]
         
         # Self Augment Visual
         vis = self.augment(vis_flat) # [B, HW, C]
@@ -165,47 +156,61 @@ class CrossAttentionLFFI(nn.Module):
 
 class FPNAdapter(nn.Module):
     """
-    Adapts the isotropic ViT output (14x14) to a Feature Pyramid.
-    Generates features at scales: 1/16 (14x14), 1/8 (28x28), 1/4 (56x56), 1/2 (112x112).
+    Adapts the Multi-Scale ViT outputs to a Feature Pyramid.
+    Inputs: [feat_last(14), feat_s3(14), feat_s2(14), feat_s1(14)] -> Actually ViT is isotropic, so all are 14x14
+    But we want to upsample them to form a pyramid.
+    
+    We assume inputs are [feat_layer12, feat_layer9, feat_layer6, feat_layer3] (all 14x14)
+    We want outputs:
+    s1: 14x14 (from layer 12)
+    s2: 28x28 (from layer 9)
+    s3: 56x56 (from layer 6)
+    s4: 112x112 (from layer 3)
     """
     def __init__(self, in_channels=768, out_channels=[768, 384, 192, 96]):
         super().__init__()
         
-        # Scale 1 (14x14) - Bottleneck
+        # Scale 1 (14x14) - Bottleneck (from Layer 12)
         self.scale1_conv = nn.Sequential(
             nn.Conv2d(in_channels, out_channels[0], kernel_size=1),
             nn.BatchNorm2d(out_channels[0]),
             nn.ReLU(inplace=True)
         )
         
-        # Scale 2 (28x28)
+        # Scale 2 (28x28) - Skip 1 (from Layer 9)
         self.scale2_up = nn.Sequential(
-            nn.ConvTranspose2d(in_channels, out_channels[1], kernel_size=2, stride=2),
+            nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False),
+            nn.Conv2d(in_channels, out_channels[1], kernel_size=3, padding=1),
             nn.BatchNorm2d(out_channels[1]),
             nn.ReLU(inplace=True)
         )
         
-        # Scale 3 (56x56)
+        # Scale 3 (56x56) - Skip 2 (from Layer 6)
         self.scale3_up = nn.Sequential(
-            nn.ConvTranspose2d(in_channels, out_channels[2], kernel_size=4, stride=4),
+            nn.Upsample(scale_factor=4, mode='bilinear', align_corners=False),
+            nn.Conv2d(in_channels, out_channels[2], kernel_size=3, padding=1),
             nn.BatchNorm2d(out_channels[2]),
             nn.ReLU(inplace=True)
         )
         
-        # Scale 4 (112x112)
+        # Scale 4 (112x112) - Skip 3 (from Layer 3)
         self.scale4_up = nn.Sequential(
-            nn.ConvTranspose2d(in_channels, out_channels[3], kernel_size=8, stride=8),
+            nn.Upsample(scale_factor=8, mode='bilinear', align_corners=False),
+            nn.Conv2d(in_channels, out_channels[3], kernel_size=3, padding=1),
             nn.BatchNorm2d(out_channels[3]),
             nn.ReLU(inplace=True)
         )
 
-    def forward(self, x):
-        # x: [B, C, 14, 14]
+    def forward(self, features):
+        # features: list of [feat_layer12, feat_layer9, feat_layer6, feat_layer3]
+        # All are [B, C, 14, 14]
         
-        s1 = self.scale1_conv(x) # 14x14
-        s2 = self.scale2_up(x)   # 28x28
-        s3 = self.scale3_up(x)   # 56x56
-        s4 = self.scale4_up(x)   # 112x112
+        x12, x9, x6, x3 = features
+        
+        s1 = self.scale1_conv(x12) # 14x14
+        s2 = self.scale2_up(x9)    # 28x28
+        s3 = self.scale3_up(x6)    # 56x56
+        s4 = self.scale4_up(x3)    # 112x112
         
         return [s1, s2, s3, s4]
 

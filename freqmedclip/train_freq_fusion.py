@@ -202,18 +202,33 @@ class FrequencyMedCLIPSAMv2(nn.Module):
         hidden_states = vision_outputs.hidden_states
         
         # Extract features (B, 197, 768)
-        # We only need the last layer output for FPNAdapter
-        f_last = hidden_states[-1][:, 1:, :] # (B, 196, 768)
+        # We need intermediate layers for FPNAdapter: [3, 6, 9, 12]
+        # hidden_states is a tuple of (embeddings, layer_1, ..., layer_12)
+        # So index 0 is embeddings, index 1 is layer 1 output.
+        # We want output of layer 3, 6, 9, 12.
+        # Indices in hidden_states: 3, 6, 9, 12 (if 1-based from embeddings?)
+        # Let's check: len(hidden_states) = 13 (embeddings + 12 layers)
+        # hidden_states[0] = embeddings
+        # hidden_states[1] = layer 1 output
+        # ...
+        # hidden_states[12] = layer 12 output (final)
         
-        B, N, C = f_last.shape
-        H = W = int(N**0.5) # 14
+        # We want layers 3, 6, 9, 12
+        layers_idx = [12, 9, 6, 3] # Order: s1(14), s2(28), s3(56), s4(112)
         
-        # Reshape to (B, C, 14, 14)
-        x_vit_last = f_last.permute(0, 2, 1).view(B, C, H, W)
+        fpn_inputs = []
+        for idx in layers_idx:
+            # (B, 197, 768) -> remove cls token -> (B, 196, 768)
+            feat = hidden_states[idx][:, 1:, :] 
+            B, N, C = feat.shape
+            H = W = int(N**0.5) # 14
+            # Reshape to (B, C, 14, 14)
+            feat_reshaped = feat.permute(0, 2, 1).view(B, C, H, W)
+            fpn_inputs.append(feat_reshaped)
         
         # 2. FPN Adapter (Generate Multi-Scale Features)
-        # [s1(14), s2(28), s3(56), s4(112)]
-        fpn_feats = self.fpn_adapter(x_vit_last)
+        # Input: list of [feat12, feat9, feat6, feat3]
+        fpn_feats = self.fpn_adapter(fpn_inputs)
         x_bottleneck = fpn_feats[0] # 14x14
         x_skip1 = fpn_feats[1]      # 28x28
         x_skip2 = fpn_feats[2]      # 56x56
@@ -228,7 +243,16 @@ class FrequencyMedCLIPSAMv2(nn.Module):
 
         # 4. Parallel Frequency Encoder
         # DWT on original image (B, 3, 224, 224) -> (B, 9, 112, 112)
-        dwt_feats = self.dwt_module(pixel_values)
+        # FIX: Denormalize pixel_values before DWT to avoid noise amplification
+        # pixel_values are normalized with mean=(0.48145466, 0.4578275, 0.40821073), std=(0.26862954, 0.26130258, 0.27577711)
+        mean = torch.tensor([0.48145466, 0.4578275, 0.40821073], device=pixel_values.device).view(1, 3, 1, 1)
+        std = torch.tensor([0.26862954, 0.26130258, 0.27577711], device=pixel_values.device).view(1, 3, 1, 1)
+        
+        denorm_imgs = pixel_values * std + mean
+        # Clip to [0, 1] just in case
+        denorm_imgs = torch.clamp(denorm_imgs, 0, 1)
+        
+        dwt_feats = self.dwt_module(denorm_imgs)
         
         # Encode Frequency Features: [f3(14), f2(28), f1(56)]
         freq_feats = self.freq_encoder(dwt_feats, text_embeds=text_embeds)
