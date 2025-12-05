@@ -174,14 +174,14 @@ class FrequencyMedCLIPSAMv2(nn.Module):
         # Branch 1: Main (ViT)
         self.decoder16 = Decoder(feature_dim[0], feature_dim[1], self.spatial_dim[0], 77, embed_dim=768) # 768->384, 14->28
         self.decoder8 = Decoder(feature_dim[1], feature_dim[2], self.spatial_dim[1], 77, embed_dim=768)  # 384->192, 28->56
-        self.decoder4 = Decoder(feature_dim[2], feature_dim[3], self.spatial_dim[2], 77, embed_dim=384)  # 192->96,  56->112
+        self.decoder4 = Decoder(feature_dim[2], feature_dim[3], self.spatial_dim[2], 77, embed_dim=768)  # 192->96,  56->112
         self.decoder1 = SubpixelUpsample(2, feature_dim[3], 24, 2) # 96->24, 112->224 (scale=2)
         self.out = UnetOutBlock(2, in_channels=24, out_channels=1)
         
         # Branch 2: Frequency
         self.decoder16_2 = Decoder(feature_dim[0], feature_dim[1], self.spatial_dim[0], 77, embed_dim=768)
         self.decoder8_2 = Decoder(feature_dim[1], feature_dim[2], self.spatial_dim[1], 77, embed_dim=768)
-        self.decoder4_2 = Decoder(feature_dim[2], feature_dim[3], self.spatial_dim[2], 77, embed_dim=384)
+        self.decoder4_2 = Decoder(feature_dim[2], feature_dim[3], self.spatial_dim[2], 77, embed_dim=768)
         self.decoder1_2 = SubpixelUpsample(2, feature_dim[3], 24, 2)
         self.out_2 = UnetOutBlock(2, in_channels=24, out_channels=1)
         
@@ -193,7 +193,7 @@ class FrequencyMedCLIPSAMv2(nn.Module):
         kernel = torch.tensor([[-1, -1, -1], 
                                [-1,  8, -1], 
                                [-1, -1, -1]], dtype=torch.float32, device=pixel_values.device)
-        kernel = kernel.view(1, 1, 3, 3).repeat(3, 1, 1, 1))
+        kernel = kernel.view(1, 1, 3, 3).repeat(3, 1, 1, 1)
         high_freq = F.conv2d(pixel_values, kernel, padding=1, groups=3)
         
         return high_freq
@@ -332,6 +332,7 @@ def main():
     parser.add_argument('--lr', type=float, default=1e-4) 
     parser.add_argument('--backbone-lr', type=float, default=1e-5) 
     parser.add_argument('--save-dir', type=str, default='../checkpoints')
+    parser.add_argument('--resume', type=str, default='', help='Path to checkpoint to resume from')
     parser.add_argument('--dry-run', action='store_true', help='Run a single batch for debugging')
     args = parser.parse_args()
     
@@ -382,6 +383,33 @@ def main():
     bce_criterion = nn.BCEWithLogitsLoss()
     hnl_criterion = HardNegativeLoss()
     
+    # Load checkpoint if resuming
+    start_epoch = 0
+    if args.resume:
+        if os.path.isfile(args.resume):
+            print(f"Loading checkpoint: {args.resume}")
+            checkpoint = torch.load(args.resume, map_location=device)
+            
+            # Check if checkpoint is wrapped or direct state_dict
+            if isinstance(checkpoint, dict) and 'model_state_dict' in checkpoint:
+                model.load_state_dict(checkpoint['model_state_dict'])
+                if 'optimizer_state_dict' in checkpoint:
+                    optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+                if 'epoch' in checkpoint:
+                    start_epoch = checkpoint['epoch']
+            else:
+                # Direct state_dict
+                model.load_state_dict(checkpoint)
+                # Extract epoch from filename
+                import re
+                match = re.search(r'epoch(\d+)', os.path.basename(args.resume))
+                if match:
+                    start_epoch = int(match.group(1))
+            
+            print(f"Resumed from epoch {start_epoch}")
+        else:
+            print(f"No checkpoint found at {args.resume}, starting from scratch")
+    
     # Training Loop
     print("Starting Training...")
     os.makedirs(args.save_dir, exist_ok=True)
@@ -392,7 +420,7 @@ def main():
     best_dice = 0.0
     best_epoch = 0
     
-    for epoch in range(args.epochs):
+    for epoch in range(start_epoch, args.epochs):
         model.train()
         epoch_loss = 0
         

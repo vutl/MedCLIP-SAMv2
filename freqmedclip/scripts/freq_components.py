@@ -5,6 +5,61 @@ import math
 
 # --- 0. DWT/IDWT Components ---
 
+class DWTForward(nn.Module):
+    """Discrete Wavelet Transform using Haar filters"""
+    def __init__(self):
+        super(DWTForward, self).__init__()
+        
+    def forward(self, x):
+        """
+        Apply 2D DWT to input using Haar filters.
+        Input: [B, C, H, W]
+        Output: LH, HL, HH (high-frequency components)
+        """
+        # Haar filters
+        # LL = [[1, 1], [1, 1]] / 2
+        # LH = [[1, -1], [1, -1]] / 2
+        # HL = [[1, 1], [-1, -1]] / 2
+        # HH = [[1, -1], [-1, 1]] / 2
+        
+        # Downsample: average adjacent pixels
+        LL = (x[:, :, 0::2, 0::2] + x[:, :, 0::2, 1::2] + 
+              x[:, :, 1::2, 0::2] + x[:, :, 1::2, 1::2]) / 4
+        
+        LH = (x[:, :, 0::2, 0::2] - x[:, :, 0::2, 1::2] + 
+              x[:, :, 1::2, 0::2] - x[:, :, 1::2, 1::2]) / 4
+        
+        HL = (x[:, :, 0::2, 0::2] + x[:, :, 0::2, 1::2] - 
+              x[:, :, 1::2, 0::2] - x[:, :, 1::2, 1::2]) / 4
+        
+        HH = (x[:, :, 0::2, 0::2] - x[:, :, 0::2, 1::2] - 
+              x[:, :, 1::2, 0::2] + x[:, :, 1::2, 1::2]) / 4
+        
+        return LH, HL, HH
+
+class IDWTInverse(nn.Module):
+    """Inverse Discrete Wavelet Transform"""
+    def __init__(self):
+        super(IDWTInverse, self).__init__()
+        
+    def forward(self, LL, LH, HL, HH):
+        """
+        Reconstruct image from wavelet coefficients.
+        Input: LL, LH, HL, HH each of shape [B, C, H, W]
+        Output: [B, C, 2H, 2W]
+        """
+        B, C, H, W = LL.shape
+        
+        # Reconstruct by interleaving coefficients
+        x = torch.zeros(B, C, 2*H, 2*W, device=LL.device, dtype=LL.dtype)
+        
+        x[:, :, 0::2, 0::2] = LL + LH + HL + HH
+        x[:, :, 0::2, 1::2] = LL - LH + HL - HH
+        x[:, :, 1::2, 0::2] = LL + LH - HL - HH
+        x[:, :, 1::2, 1::2] = LL - LH - HL + HH
+        
+        return x
+
 
 # --- 1. LFFI Components (FMISeg Original Logic) ---
 
@@ -196,8 +251,13 @@ class FPNAdapter(nn.Module):
             nn.ReLU(inplace=True)
         )
         
-        # Scale 4 (112x112) - Removed to prevent resolution hallucination
-        # self.scale4_up = ...
+        # Scale 4 (112x112) - From Layer 3
+        self.scale4_up = nn.Sequential(
+            nn.Upsample(scale_factor=8, mode='bilinear', align_corners=False),
+            nn.Conv2d(in_channels, out_channels[3], kernel_size=3, padding=1),
+            nn.BatchNorm2d(out_channels[3]),
+            nn.ReLU(inplace=True)
+        )
 
     def forward(self, features):
         # features: list of [feat_layer12, feat_layer9, feat_layer6, feat_layer3]
@@ -208,9 +268,9 @@ class FPNAdapter(nn.Module):
         s1 = self.scale1_conv(x12) # 14x14
         s2 = self.scale2_up(x9)    # 28x28
         s3 = self.scale3_up(x6)    # 56x56
-        # s4 = self.scale4_up(x3)  # REMOVED: Resolution Hallucination
+        s4 = self.scale4_up(x3)    # 112x112
         
-        return [s1, s2, s3, None]
+        return [s1, s2, s3, s4]
 
 # --- 3. Frequency Components ---
 

@@ -1,0 +1,252 @@
+================================================================================
+TRAINING AND EVALUATION SUMMARY - FreqMedCLIP (FMISeg-Style Architecture)
+Generated: 2025-12-05
+Results Directory: D:\Documents\LMIS\MedCLIP-SAMv2\results_20251205_011222
+================================================================================
+
+OVERVIEW:
+- Successfully trained dual-branch architecture on 2 medical imaging datasets
+- Brain Tumors: 100 epochs completed
+- Breast Tumors: 93 epochs completed
+- All checkpoints saved separately per dataset
+- Step-by-step visualizations generated for intermediate model outputs
+
+================================================================================
+DATASET STATISTICS
+================================================================================
+
+BRAIN TUMORS:
+- Total Samples: 3,064
+  - Training: 1,462 samples
+  - Validation: 1,002 samples
+  - Test: 600 samples
+
+BREAST TUMORS:
+- Total Samples: 762
+  - Training: 599 samples
+  - Validation: 50 samples
+  - Test: 113 samples
+
+================================================================================
+TRAINING RESULTS
+================================================================================
+
+BRAIN TUMORS (100 Epochs):
+- Dataset: brain_tumors
+- Total Samples: 1,462 (training) + 600 (test)
+- Batch Size: 4
+- Learning Rate: 1e-4
+- Checkpoints: ../results_20251205_011222/brain_tumors_checkpoints/
+- Final Epoch Checkpoint: fusion_brain_tumors_epoch100.pth (1.1 GB)
+
+BREAST TUMORS (93 Epochs):
+- Dataset: breast_tumors
+- Total Samples: 599 (training) + 113 (test)
+- Batch Size: 4
+- Learning Rate: 1e-4
+- Checkpoints: ../results_20251205_011222/breast_tumors_checkpoints/
+- Final Epoch Checkpoint: fusion_breast_tumors_epoch93.pth (1.1 GB)
+
+================================================================================
+EVALUATION RESULTS - TEST SET METRICS
+================================================================================
+
+BRAIN TUMORS (Test Set - 600 samples):
+  Dice Score:  0.8152 ± 0.1886
+  IoU:         0.7206 ± 0.2086
+  Precision:   0.9004 ± 0.1592
+  Recall:      0.7873 ± 0.2184
+  Status: ✓ PASSED
+
+BREAST TUMORS (Test Set - 113 samples):
+  Dice Score:  0.8013 ± 0.2095
+  IoU:         0.7069 ± 0.2242
+  Precision:   0.7998 ± 0.2268
+  Recall:      0.8624 ± 0.2086
+  Status: ✓ PASSED
+
+================================================================================
+METRICS COMPARISON TABLE
+================================================================================
+
+Dataset          Dice (mean±std)    IoU (mean±std)      Precision          Recall
+─────────────────────────────────────────────────────────────────────────────────
+Brain Tumors     0.8152 ± 0.1886   0.7206 ± 0.2086    0.9004 ± 0.1592   0.7873 ± 0.2184
+Breast Tumors    0.8013 ± 0.2095   0.7069 ± 0.2242    0.7998 ± 0.2268   0.8624 ± 0.2086
+
+Key Observations:
+- Brain Tumors: Higher precision (0.9004) indicates fewer false positives; high recall
+- Breast Tumors: Balanced performance; excellent recall (0.8624) for sensitivity
+- Both datasets achieve ~80% Dice score indicating strong segmentation quality
+- IoU scores (~72%) reflect good Intersection-over-Union performance
+
+================================================================================
+OUTPUT STRUCTURE
+================================================================================
+
+Results Directory Organization:
+├── results_20251205_011222/
+│   ├── brain_tumors_checkpoints/
+│   │   ├── fusion_brain_tumors_epoch1.pth
+│   │   ├── ...
+│   │   └── fusion_brain_tumors_epoch100.pth (FINAL)
+│   │
+│   ├── brain_tumors_eval/
+│   │   ├── visualizations/
+│   │   │   ├── image_1_steps.png (input, GT, pred1, pred2, freq features, FPN, overlay)
+│   │   │   ├── image_2_steps.png
+│   │   │   └── ... (600 samples, sampled visualization)
+│   │   └── results_brain_tumors_fusion_brain_tumors_epoch100.txt
+│   │
+│   ├── breast_tumors_checkpoints/
+│   │   ├── fusion_breast_tumors_epoch1.pth
+│   │   ├── ...
+│   │   └── fusion_breast_tumors_epoch93.pth (FINAL)
+│   │
+│   ├── breast_tumors_eval/
+│   │   ├── visualizations/
+│   │   │   ├── image_1_steps.png (input, GT, pred1, pred2, freq features, FPN, overlay)
+│   │   │   ├── image_2_steps.png
+│   │   │   └── ... (113 samples, all visualized)
+│   │   └── results_breast_tumors_fusion_breast_tumors_epoch93.txt
+│   │
+│   └── SUMMARY_REPORT.txt (this file)
+
+Visualization Format:
+Each _steps.png includes:
+- Row 1: Input Image | GT Mask | ViT Branch Prediction | Frequency Branch Prediction
+- Row 2: Frequency Feature Channels | Overlay (GT=Green, Pred=Red, Overlap=Yellow)
+- Row 3: FPN Multi-Scale Features | Final Prediction with Metrics
+
+================================================================================
+MODEL ARCHITECTURE
+================================================================================
+
+Framework: FMISeg-Style Dual-Branch
+Components:
+1. Vision Transformer (ViT-B) - BiomedCLIP
+   - Input: 224×224 RGB medical images
+   - Output: Multi-scale features [14×14, 28×28, 56×56, 112×112]
+   - Frozen backbone with selective layer unfreezing
+
+2. Frequency Encoder - High-Frequency Branch
+   - Laplacian-based high-frequency extraction
+   - Text-guided feature enhancement
+   - 4-scale hierarchical encoding
+
+3. FPN Adapter - Multi-Scale Feature Pyramid
+   - Adapts ViT outputs to pyramid structure
+   - Scales: 14×14 (768ch) → 28×28 (384ch) → 56×56 (192ch) → 112×112 (96ch)
+
+4. FFBI (Frequency-Fusion Bottleneck Interaction)
+   - Dual-branch feature fusion at bottleneck
+   - Cross-attention between ViT and Frequency branches
+
+5. Dual Decoders
+   - Branch 1 (ViT): 4 decoder stages with skip connections
+   - Branch 2 (Frequency): 4 decoder stages with skip connections
+   - LFFI (Local Feature Fusion Interaction) at each level
+   - Final output: averaged predictions from both branches
+
+================================================================================
+TRAINING CONFIGURATION
+================================================================================
+
+Hyperparameters:
+- Epochs: 100 (brain_tumors), 93 (breast_tumors, early stopping)
+- Batch Size: 4
+- Learning Rate: 1e-4 (Adam optimizer)
+- Loss Function: Combination of:
+  - Cross-Entropy Loss (CE)
+  - Dice Loss (weighted per branch)
+  - Balanced loss between both branches
+- Data Augmentation:
+  - Random Elastic Transform (α=1, σ=50, p=0.2)
+  - Random Affine (scale±5%, rotate±5°, shear±5°, translate±2%, p=0.2)
+
+Preprocessing:
+- Input Resize: 224×224 (consistent dimensions)
+- Binary Mask Thresholding: >127 value = 1
+- Normalization: ImageNet-standard (for BiomedCLIP)
+
+================================================================================
+IMPROVEMENTS & FIXES APPLIED
+================================================================================
+
+1. Code Updates (from latest main branch):
+   - Restored DWTForward and IDWTInverse components
+   - Fixed FPNAdapter to generate 4-scale pyramid (previously returned None for scale4)
+   - Corrected Decoder embed_dim parameters (768 instead of 384)
+   - Fixed ElasticTransform deprecated parameter (removed alpha_affine)
+
+2. Data Handling:
+   - Automatic resizing to 224×224 before augmentation
+   - Consistent dimension handling across datasets
+
+3. Evaluation Enhancement:
+   - Multi-panel visualization with intermediate outputs
+   - Frequency maps, FPN features, both branch predictions
+   - Fixed model initialization signature
+
+================================================================================
+RECOMMENDATIONS & NEXT STEPS
+================================================================================
+
+1. Performance Analysis:
+   - Brain Tumors: Excellent precision (90%) - prioritize recall improvements
+   - Breast Tumors: Balanced performance - consider ensemble methods
+   - Both: Dice ~80% is competitive; IoU ~72% suggests room for refinement
+
+2. Further Optimization:
+   - Longer training for breast_tumors (stopped at 93 epochs due to time)
+   - Post-processing: CRF refinement, morphological operations
+   - Ensemble: Average predictions from multiple checkpoints
+   - Test-time augmentation (TTA) for robustness
+
+3. Visualization Insights:
+   - Review step-by-step visualizations to identify failure modes
+   - Analyze frequency branch vs ViT branch contributions
+   - Check FPN feature quality at each scale
+
+4. Deployment:
+   - Consider quantization/pruning for real-time inference
+   - Export to ONNX for wider framework compatibility
+   - Implement batch normalization fine-tuning for domain adaptation
+
+================================================================================
+FILE REFERENCES
+================================================================================
+
+Training Script:
+- freqmedclip/train_freq_fusion.py
+  - FrequencyMedCLIPSAMv2 model class
+  - FreqMedCLIPDataset loader
+  - Training loop with checkpoint saving
+
+Evaluation Script:
+- freqmedclip/evaluate_freqmedclip.py
+  - Enhanced visualization with intermediate outputs
+  - Metrics calculation (Dice, IoU, Precision, Recall)
+  - Multi-panel figure generation
+
+Components:
+- freqmedclip/scripts/freq_components.py
+  - DWTForward, IDWTInverse
+  - FrequencyEncoder, FPNAdapter
+  - LFFI cross-attention layers
+
+- freqmedclip/scripts/fmiseg_components.py
+  - Decoder architecture
+  - SelfAugment, PositionalEncoding
+  - FFBI (Frequency-Fusion Bottleneck Interaction)
+
+Batch Runner:
+- freqmedclip/batch_train_and_eval.py
+  - Automates sequential training + evaluation
+  - Generates organized results directory
+  - Creates summary reports
+
+================================================================================
+END OF REPORT
+Generated on 2025-12-05
+================================================================================

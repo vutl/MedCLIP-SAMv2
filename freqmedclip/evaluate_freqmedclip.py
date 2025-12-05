@@ -9,6 +9,7 @@ import numpy as np
 from transformers import AutoModel, AutoProcessor, AutoTokenizer
 import cv2
 import matplotlib.pyplot as plt
+from matplotlib.gridspec import GridSpec
 
 # Add parent directory to path
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
@@ -16,6 +17,9 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')
 # Import components
 from freqmedclip.scripts.freq_components import DWTForward, FrequencyEncoder, FPNAdapter, IDWTInverse
 from freqmedclip.train_freq_fusion import FreqMedCLIPDataset, FrequencyMedCLIPSAMv2
+
+# Storage for intermediate outputs
+intermediate_outputs = {}
 
 def calculate_metrics(pred, target, threshold=0.5):
     """Calculate Dice, IoU, Precision, Recall"""
@@ -41,6 +45,94 @@ def calculate_metrics(pred, target, threshold=0.5):
         'precision': precision.item(),
         'recall': recall.item()
     }
+
+def visualize_intermediate_steps(vis_dir, img_name, original_image, mask_np, pred_binary, 
+                                 freq_features, fpn_features, pred1, pred2, metrics):
+    """Visualize intermediate outputs: frequency encoding, FPN features, both branches, final prediction"""
+    
+    # Normalize to 0-1 for visualization
+    def norm_tensor(t):
+        if t is None:
+            return None
+        t = t.detach().cpu()
+        if len(t.shape) > 2:
+            t = t.mean(dim=0)  # Average channels
+        tmin = t.min()
+        tmax = t.max()
+        if tmax > tmin:
+            t = (t - tmin) / (tmax - tmin)
+        return t.numpy()
+    
+    # Create a comprehensive figure with multiple subplots
+    fig = plt.figure(figsize=(20, 12))
+    gs = GridSpec(3, 4, figure=fig, hspace=0.3, wspace=0.3)
+    
+    # Row 1: Input, GT, Pred1 (ViT), Pred2 (Frequency)
+    ax1 = fig.add_subplot(gs[0, 0])
+    ax1.imshow(original_image)
+    ax1.set_title('Input Image')
+    ax1.axis('off')
+    
+    ax2 = fig.add_subplot(gs[0, 1])
+    ax2.imshow(mask_np, cmap='gray')
+    ax2.set_title('Ground Truth Mask')
+    ax2.axis('off')
+    
+    pred1_vis = norm_tensor(pred1.squeeze(0) if len(pred1.shape) > 2 else pred1)
+    ax3 = fig.add_subplot(gs[0, 2])
+    ax3.imshow(pred1_vis, cmap='gray')
+    ax3.set_title('Pred (ViT Branch)')
+    ax3.axis('off')
+    
+    pred2_vis = norm_tensor(pred2.squeeze(0) if len(pred2.shape) > 2 else pred2)
+    ax4 = fig.add_subplot(gs[0, 3])
+    ax4.imshow(pred2_vis, cmap='gray')
+    ax4.set_title('Pred (Freq Branch)')
+    ax4.axis('off')
+    
+    # Row 2: Frequency features (up to 4 channels)
+    if freq_features is not None and len(freq_features.shape) > 2:
+        freq_vis = norm_tensor(freq_features)
+        for idx in range(min(3, freq_features.shape[0])):
+            ax = fig.add_subplot(gs[1, idx])
+            freq_ch = norm_tensor(freq_features[idx])
+            ax.imshow(freq_ch, cmap='viridis')
+            ax.set_title(f'Freq Feature Ch{idx}')
+            ax.axis('off')
+    
+    # Row 2, col 3: Overlay (GT vs Final Pred)
+    ax_overlay = fig.add_subplot(gs[1, 3])
+    overlay = np.zeros((*mask_np.shape, 3))
+    overlay[mask_np > 0.5] = [0, 1, 0]  # Green for GT
+    overlay[pred_binary > 0.5] = [1, 0, 0]  # Red for pred
+    overlay[(mask_np > 0.5) & (pred_binary > 0.5)] = [1, 1, 0]  # Yellow for overlap
+    ax_overlay.imshow(overlay)
+    ax_overlay.set_title(f'Overlay\nDice: {metrics["dice"]:.3f}')
+    ax_overlay.axis('off')
+    
+    # Row 3: FPN features (multi-scale)
+    if fpn_features is not None:
+        for idx, fpn_feat in enumerate(fpn_features[:3]):
+            fpn_vis = norm_tensor(fpn_feat)
+            ax = fig.add_subplot(gs[2, idx])
+            if fpn_vis is not None:
+                ax.imshow(fpn_vis, cmap='hot')
+                ax.set_title(f'FPN Scale {idx}')
+            ax.axis('off')
+    
+    # Row 3, col 3: Final prediction
+    ax_final = fig.add_subplot(gs[2, 3])
+    ax_final.imshow(pred_binary, cmap='gray')
+    ax_final.set_title(f'Final Pred (Threshold=0.5)\nIoU: {metrics["iou"]:.3f}')
+    ax_final.axis('off')
+    
+    plt.suptitle(f'{img_name} | Precision: {metrics["precision"]:.3f} | Recall: {metrics["recall"]:.3f}', 
+                 fontsize=14, fontweight='bold')
+    
+    save_path = os.path.join(vis_dir, f"{img_name.replace('.png', '')}_steps.png")
+    plt.savefig(save_path, dpi=150, bbox_inches='tight')
+    plt.close()
+
 
 def main():
     parser = argparse.ArgumentParser()
@@ -68,8 +160,7 @@ def main():
     freq_encoder = FrequencyEncoder(in_channels=3, base_channels=96, text_dim=768).to(device)
     
     # Create model
-    # Note: args passed here are just for config if needed, we can pass a dummy object or the parser args
-    model = FrequencyMedCLIPSAMv2(biomedclip, dwt, idwt, freq_encoder, fpn_adapter, args).to(device)
+    model = FrequencyMedCLIPSAMv2(biomedclip, freq_encoder, fpn_adapter, args).to(device)
     
     # Load checkpoint
     print(f"Loading checkpoint: {args.checkpoint}")
@@ -122,53 +213,89 @@ def main():
             masks = batch['mask'].to(device)
             img_names = batch['img_name']
             
+            # Forward pass - capture intermediate outputs from model
+            # Patch model forward to capture intermediate tensors
+            freq_features_list = []
+            fpn_features_list = []
+            
+            # Hook into FrequencyEncoder to capture freq features
+            def freq_hook(module, input, output):
+                if isinstance(output, (list, tuple)):
+                    freq_features_list.extend([o.detach() if isinstance(o, torch.Tensor) else o for o in output])
+                elif isinstance(output, torch.Tensor):
+                    freq_features_list.append(output.detach())
+                else:
+                    freq_features_list.append(output)
+            
+            # Hook into FPNAdapter to capture FPN features
+            def fpn_hook(module, input, output):
+                if isinstance(output, (list, tuple)):
+                    fpn_features_list.extend([o.detach() for o in output if isinstance(o, torch.Tensor)])
+                else:
+                    fpn_features_list.append(output.detach())
+            
+            # Register hooks if available
+            freq_hook_handle = None
+            fpn_hook_handle = None
+            
+            try:
+                if hasattr(model, 'freq_encoder'):
+                    freq_hook_handle = model.freq_encoder.register_forward_hook(freq_hook)
+                if hasattr(model, 'fpn_adapter'):
+                    fpn_hook_handle = model.fpn_adapter.register_forward_hook(fpn_hook)
+            except:
+                pass
+            
             # Forward
-            # Model returns: out, out_2, img_feats_pooled, text_feats_pooled
-            # Use Average of both branches
-            # preds1 is ViT branch (now with injected high-res features)
-            # preds2 is Frequency branch (native high-res)
             preds1, preds2, _, _ = model(pixel_values, input_ids)
             preds = (preds1 + preds2) / 2
             preds = preds.squeeze(1)
+            
+            # Remove hooks
+            if freq_hook_handle is not None:
+                freq_hook_handle.remove()
+            if fpn_hook_handle is not None:
+                fpn_hook_handle.remove()
             
             # Calculate metrics and save visualizations for each sample in batch
             for i in range(preds.shape[0]):
                 metrics = calculate_metrics(preds[i], masks[i])
                 all_metrics.append(metrics)
                 
-                # Save visualization every 10 samples or first 5
+                # Save comprehensive visualization for first 5 samples + every 10th
                 if sample_count < 5 or sample_count % 10 == 0:
                     pred_binary = (torch.sigmoid(preds[i]) > 0.5).cpu().numpy()
                     mask_np = masks[i].cpu().numpy()
                     
-                    # Create visualization
-                    fig, axes = plt.subplots(1, 3, figsize=(15, 5))
+                    # Get original image from batch for context
+                    # Denormalize pixel_values to get image
+                    img_np = pixel_values[i].cpu().numpy()
+                    img_np = np.transpose(img_np, (1, 2, 0))
+                    img_np = (img_np - img_np.min()) / (img_np.max() - img_np.min() + 1e-8)
                     
-                    # Ground truth
-                    axes[0].imshow(mask_np, cmap='gray')
-                    axes[0].set_title('Ground Truth')
-                    axes[0].axis('off')
+                    # Extract intermediate features
+                    freq_feat = freq_features_list[0][i] if freq_features_list else None
+                    fpn_feats = [f[i] for f in fpn_features_list] if fpn_features_list else []
                     
-                    # Prediction
-                    axes[1].imshow(pred_binary, cmap='gray')
-                    axes[1].set_title(f'Prediction\nDice: {metrics["dice"]:.3f}')
-                    axes[1].axis('off')
-                    
-                    # Overlay
-                    overlay = np.zeros((*mask_np.shape, 3))
-                    overlay[mask_np > 0.5] = [0, 1, 0]  # Green for GT
-                    overlay[pred_binary > 0.5] = [1, 0, 0]  # Red for pred
-                    overlay[(mask_np > 0.5) & (pred_binary > 0.5)] = [1, 1, 0]  # Yellow for overlap
-                    axes[2].imshow(overlay)
-                    axes[2].set_title('Overlay (GT=Green, Pred=Red)')
-                    axes[2].axis('off')
-                    
-                    plt.tight_layout()
-                    save_path = os.path.join(vis_dir, f"{img_names[i].replace('.png', '')}_vis.png")
-                    plt.savefig(save_path, dpi=150, bbox_inches='tight')
-                    plt.close()
+                    # Visualize all steps
+                    visualize_intermediate_steps(
+                        vis_dir, 
+                        img_names[i],
+                        img_np,
+                        mask_np,
+                        pred_binary,
+                        freq_feat,
+                        fpn_feats if fpn_feats else None,
+                        preds1[i] if preds1 is not None else preds[i],
+                        preds2[i] if preds2 is not None else preds[i],
+                        metrics
+                    )
                 
                 sample_count += 1
+            
+            # Clear intermediate lists for next batch
+            freq_features_list.clear()
+            fpn_features_list.clear()
     
     # Aggregate results
     print("\n" + "="*60)
