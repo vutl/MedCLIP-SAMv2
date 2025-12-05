@@ -389,9 +389,23 @@ def main():
         if os.path.isfile(args.resume):
             print(f"Loading checkpoint: {args.resume}")
             checkpoint = torch.load(args.resume, map_location=device)
-            model.load_state_dict(checkpoint['model_state_dict'])
-            optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-            start_epoch = checkpoint['epoch']
+            
+            # Check if checkpoint is wrapped or direct state_dict
+            if isinstance(checkpoint, dict) and 'model_state_dict' in checkpoint:
+                model.load_state_dict(checkpoint['model_state_dict'])
+                if 'optimizer_state_dict' in checkpoint:
+                    optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+                if 'epoch' in checkpoint:
+                    start_epoch = checkpoint['epoch']
+            else:
+                # Direct state_dict
+                model.load_state_dict(checkpoint)
+                # Extract epoch from filename
+                import re
+                match = re.search(r'epoch(\d+)', os.path.basename(args.resume))
+                if match:
+                    start_epoch = int(match.group(1))
+            
             print(f"Resumed from epoch {start_epoch}")
         else:
             print(f"No checkpoint found at {args.resume}, starting from scratch")
