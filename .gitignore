@@ -7,10 +7,15 @@ visualizations/
 
 # Checkpoints and models
 checkpoints/
+*.pth
+*.pt
+*.ckpt
+*.safetensors
 saliency_maps/model/pytorch_model.bin
 segment-anything/sam_checkpoints/
 biomedclip_finetuning/open_clip/src/data/
 results_*/
+freqmedclip/results_*/
 
 # External repositories
 FMISeg/
