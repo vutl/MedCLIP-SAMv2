@@ -483,8 +483,8 @@ def main():
     dice_criterion = DiceLoss()
     bce_criterion = nn.BCEWithLogitsLoss()
     # SpecTr Losses
-    recoupling_criterion = RecouplingLoss(in_channels=24, text_dim=768) 
-    edge_target_gen = MorphologicalEdgeTarget()
+    recoupling_criterion = RecouplingLoss(in_channels=24, text_dim=768).to(device)
+    edge_target_gen = MorphologicalEdgeTarget().to(device)
     
     # Load checkpoint if resuming
     start_epoch = 0
