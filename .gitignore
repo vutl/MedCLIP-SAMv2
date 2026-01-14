@@ -46,6 +46,8 @@ __pycache__/
 dist/
 build/
 
+/context/
+
 # IDE
 .vscode/
 .idea/
